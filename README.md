@@ -1,46 +1,138 @@
-# qinglong-scripts
+<div align="center">
+<img width="100" src="https://user-images.githubusercontent.com/22700758/191449379-f9f56204-0e31-4a16-be5a-331f52696a73.png">
 
-Backup of the task scripts running in the Qinglong panel on the platform
-serv00 machine (https://ql.platform.serv00.net/, Qinglong v2.24.0).
+<h1 align="center">青龙</h1>
 
-## Task scripts
+简体中文 | [English](./README-en.md)
 
-| File | Schedule | What it does |
-| --- | --- | --- |
-| `X_lastMS_tg.py` | daily 08:10 | Fetch the latest 2 original posts for 6 X accounts via twexapi.io and send new ones to a Telegram group. Dedup via `x_sent_ids.json`. |
-| `pull_muse_usage.py` | every 15 min | Fetch `muse-usage_all.json`, mask 账号1 with `*`, write `panel/muse_usage.json` for the fleet dashboard. |
-| `pull_drive_acount1.sh` | every 15 min | Pull 账号1's Muse usage JSON from Google Drive (URL in `usage_pull/drive_url_acount1.txt`) to `muse-usageAcount1.json`. |
-| `pull_drive_acount2.sh` | every 15 min | Pull 账号2's Muse usage JSON from Google Drive (URL in `usage_pull/drive_url.txt`) to `muse-usageAcount2.json`. |
-| `pull_drive.sh` | — | Same as `pull_drive_acount2.sh` (generic Drive pull). |
+支持 Python3、JavaScript、Shell、Typescript 的定时任务管理平台
 
-## One-off patch / verify scripts (already applied)
+Timed task management platform supporting Python3, JavaScript, Shell, Typescript
 
-| File | What it did |
-| --- | --- |
-| `patch_muse_usage.py` | Patched `panel_fleet.py` to merge `muse_usage.json` into `/api/fleet` and render the Muse usage table. |
-| `patch_pubwsgi_muse.py` | Patched `public_python/passenger_wsgi.py` the same way (this is the live one). |
-| `patch_wsgi_muse.py` | Patched the domain-root `passenger_wsgi.py` the same way. |
-| `patch_remain_col.py` | Added the 剩余额度 column to the Muse usage table. |
-| `check_fleet_muse2.py` | Verified `/api/fleet` muse_usage twice, 30 s apart. |
-| `check_fleet_remain.py` | Verified `/api/fleet` muse_usage and `remaining_percent_text`. |
-| `seed_x_sent.py` | Seeded `x_sent_ids.json` with the latest 2 originals per account. |
-| `seed_x_sent_rl.py` | Same, rate-limited (one account every 5 min) to avoid the viewer API 429. |
+[![npm version][npm-version-image]][npm-version-url] [![docker pulls][docker-pulls-image]][docker-pulls-url] [![docker stars][docker-stars-image]][docker-stars-url] [![docker image size][docker-image-size-image]][docker-image-size-url]
 
-## Notification library
+[npm-version-image]: https://img.shields.io/npm/v/@whyour/qinglong?style=flat
+[npm-version-url]: https://www.npmjs.com/package/@whyour/qinglong?activeTab=readme
+[docker-pulls-image]: https://img.shields.io/docker/pulls/whyour/qinglong?style=flat
+[docker-pulls-url]: https://hub.docker.com/r/whyour/qinglong
+[docker-stars-image]: https://img.shields.io/docker/stars/whyour/qinglong?style=flat
+[docker-stars-url]: https://hub.docker.com/r/whyour/qinglong
+[docker-image-size-image]: https://img.shields.io/docker/image-size/whyour/qinglong?style=flat
+[docker-image-size-url]: https://hub.docker.com/r/whyour/qinglong
 
-- `notify.py` / `sendNotify.js` — Qinglong notification modules (with custom
-  additions). All notification tokens are empty strings here; real tokens live
-  only in the panel's `config.sh` / environment, never in this repo.
+[Demo](http://demo.qinglong.online:4433/) / [Issues](https://github.com/whyour/qinglong/issues) / [Telegram Channel](https://t.me/jiao_long) / [Buy Me a Coffee](https://www.buymeacoffee.com/qinglong)
 
-## Secrets
+[演示](http://demo.qinglong.online:4433/) / [反馈](https://github.com/whyour/qinglong/issues) / [Telegram 频道](https://t.me/jiao_long) / [打赏开发者](https://user-images.githubusercontent.com/22700758/244744295-29cd0cd1-c8bb-4ea1-adf6-29bd390ad4dd.jpg)
+</div>
 
-No tokens, keys, or credentials are stored in this repo. Scripts read secrets
-from environment variables or from local files on the server
-(`TG_BOT_TOKEN` / `TG_CHAT_ID`, `usage_pull/drive_url*.txt`,
-`panel/token.txt`). Do not commit those files.
+![cover](https://user-images.githubusercontent.com/22700758/244847235-8dc1ca21-e03f-4606-9458-0541fab60413.png)
 
-## Notes
+## 功能
 
-- `x_sent_ids.json` (dedup state, changes every run) is intentionally not
-  committed.
-- `cryptoTrader_report/` (the TG report project tree) is not included here.
+- 支持多种脚本语言（python3、javaScript、shell、typescript）
+- 支持在线管理脚本、环境变量、配置文件
+- 支持在线查看任务日志
+- 支持秒级任务设置
+- 支持系统级通知
+- 支持暗黑模式
+- 支持手机端操作
+- 支持通过 [远程 CLI 与 Agent Skill](#远程-cli-与-agent-skill) 管理面板
+
+## 版本
+
+### docker
+
+`latest` 镜像是基于 `alpine` 构建，`debian` 镜像是基于 `debian-slim` 构建。如果需要使用 `alpine` 不支持的依赖，建议使用 `debian` 镜像
+
+**⚠️ 重要提示**: 如果您需要以**非 root 用户**运行 Docker，请使用 `debian` 镜像。Alpine 的 `crond` 需要 root 权限。
+
+```bash
+docker pull whyour/qinglong:latest
+docker pull whyour/qinglong:debian
+```
+
+使用 `debian` 镜像以非 root 用户运行时，需指定 `--user qinglong`：
+
+```bash
+docker run -d \
+  -v /path/to/ql/data:/ql/data \
+  -p 5700:5700 \
+  --user qinglong \
+  --name qinglong \
+  whyour/qinglong:debian
+```
+
+### npm
+
+npm 版本支持 `debian/ubuntu/alpine` 系统，需要自行安装 `node/npm/python3/pip3/pnpm`
+
+```bash
+npm i @whyour/qinglong
+```
+
+## 部署
+
+[查看文档](https://qinglong.online/guide/getting-started/installation-guide)
+
+## 内置 API
+
+[查看文档](https://qinglong.online/guide/user-guide/built-in-api)
+
+## 内置命令
+
+[查看文档](https://qinglong.online/guide/user-guide/basic-explanation)
+
+## 远程 CLI 与 Agent Skill
+
+使用独立 npm 包 [@whyour/qinglong-cli](https://www.npmjs.com/package/@whyour/qinglong-cli)，可以从本机终端或自动化流程管理远程青龙面板。支持任务与订阅的创建、修改、运行和日志查看，以及应用、环境变量、脚本、配置、依赖等 OpenAPI 资源；JSON 输出便于脚本和 AI Agent 使用。
+
+需要 Node.js >=22.12，推荐 Node.js 24。安装后使用 `ql` 命令：
+
+```bash
+npm install -g @whyour/qinglong-cli
+ql login --url https://ql.example.com
+ql auth status --json
+ql task list --json
+ql subscription list --json
+ql --help
+```
+
+在面板「系统设置 → 应用设置」创建应用并授予所需权限，登录时按提示输入 Client ID/Secret；也支持通过 `QL_URL` 和 `QL_ACCESS_TOKEN` 使用已有令牌。各命令支持 `--help`，`QL_LANG=en` 可切换英文帮助。
+
+npm CLI 用于远程管理。面板内置 `ql` 同样使用这个命令名，已有面板的机器请使用独立安装目录，避免覆盖内置命令。本机脚本执行和运维见 [面板内部工具](cli/LOCAL.md)。
+
+[CLI 中文说明](cli/README.md) · [English guide](cli/README.en.md) · [完整命令参考](cli/skills/qinglong-cli/references/openapi.md)
+
+包内附带 [远程管理 Skill](cli/skills/qinglong-cli/SKILL.md)，涵盖认证、命令选择和操作结果检查，可供 AI Agent 使用。本机执行与运维另见 [内部 Skill](cli/skills/qinglong-local/SKILL.md)。
+
+## 开发
+
+```bash
+git clone https://github.com/whyour/qinglong.git
+cd qinglong
+cp .env.example .env
+# 推荐使用 pnpm https://pnpm.io/zh/installation
+npm install -g pnpm@8.3.1
+pnpm install
+pnpm start
+```
+
+打开你的浏览器，访问 <http://127.0.0.1:5700>
+
+## 链接
+
+- [nevinee](https://gitee.com/evine)
+- [crontab-ui](https://github.com/alseambusher/crontab-ui)
+- [Ant Design](https://ant.design)
+- [Ant Design Pro](https://pro.ant.design/)
+- [Umijs](https://umijs.org)
+- [darkreader](https://github.com/darkreader/darkreader)
+- [admin-server](https://github.com/sunpu007/admin-server)
+
+## 名称来源
+
+青龙，又名苍龙，在中国传统文化中是四象之一、[天之四灵](https://zh.wikipedia.org/wiki/%E5%A4%A9%E4%B9%8B%E5%9B%9B%E7%81%B5)之一，根据五行学说，它是代表东方的灵兽，为青色的龙，五行属木，代表的季节是春季，八卦主震。苍龙与应龙一样，都是身具羽翼。《张果星宗》称“又有辅翼，方为真龙”。
+
+《后汉书·律历志下》记载：日周于天，一寒一暑，四时备成，万物毕改，摄提迁次，青龙移辰，谓之岁。
+
+在中国[二十八宿](https://zh.wikipedia.org/wiki/%E4%BA%8C%E5%8D%81%E5%85%AB%E5%AE%BF)中，青龙是东方七宿（角、亢、氐、房、心、尾、箕）的总称。 在早期星宿信仰中，祂是最尊贵的天神。 但被道教信仰吸纳入其神系后，神格大跌，道教将其称为“孟章”，在不同的道经中有“帝君”、“圣将”、“神将”和“捕鬼将”等称呼，与白虎监兵神君一起，是道教的护卫天神。

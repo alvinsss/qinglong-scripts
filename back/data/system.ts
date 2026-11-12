@@ -1,0 +1,119 @@
+import { sequelize } from '.';
+import { DataTypes, Model, ModelDefined } from 'sequelize';
+import { NotificationInfo } from './notify';
+
+export class SystemInfo {
+  ip?: string;
+  type: AuthDataType;
+  info?: SystemModelInfo;
+  id?: number;
+
+  constructor(options: SystemInfo) {
+    this.ip = options.ip;
+    this.info = options.info;
+    this.type = options.type;
+    this.id = options.id;
+  }
+}
+
+export enum LoginStatus {
+  'success',
+  'fail',
+}
+
+export enum AuthDataType {
+  'loginLog' = 'loginLog',
+  'authToken' = 'authToken',
+  'notification' = 'notification',
+  'removeLogFrequency' = 'removeLogFrequency',
+  'systemConfig' = 'systemConfig',
+  'authConfig' = 'authConfig',
+  'notifyLog' = 'notifyLog',
+}
+
+export const NotifyStatus = LoginStatus;
+export type NotifyStatus = LoginStatus;
+
+export interface SystemConfigInfo {
+  lang?: string;
+  panelTitle?: string;
+  logRemoveFrequency?: number;
+  cronConcurrency?: number;
+  dependenceProxy?: string;
+  nodeMirror?: string;
+  pythonMirror?: string;
+  linuxMirror?: string;
+  timezone?: string;
+  globalSshKey?: string;
+  runningInstanceRetentionDays?: number;
+  cronStatRetentionDays?: number;
+}
+
+export interface LoginLogInfo {
+  timestamp?: number;
+  address?: string;
+  ip?: string;
+  platform?: string;
+  status?: LoginStatus;
+}
+
+export interface NotifyLogInfo {
+  timestamp?: number;
+  title?: string;
+  content?: string;
+  status?: NotifyStatus;
+  notifyType?: string;
+  source?: 'system' | 'script';
+  scriptName?: string;
+  taskId?: string;
+}
+
+export interface TokenInfo {
+  value: string;
+  timestamp: number;
+  ip: string;
+  address: string;
+  platform: string;
+  /**
+   * Token expiration time in seconds since Unix epoch.
+   * If undefined, the token uses JWT's built-in expiration.
+   */
+  expiration?: number;
+}
+
+export interface AuthInfo {
+  username: string;
+  password: string;
+  retries: number;
+  lastlogon: number;
+  lastip: string;
+  lastaddr: string;
+  platform: string;
+  isTwoFactorChecking: boolean;
+  twoFactorExpiresAt?: number;
+  lastTwoFactorStep?: number;
+  token: string;
+  tokens: Record<string, string | TokenInfo[]>;
+  twoFactorActivated: boolean;
+  twoFactorSecret: string;
+  avatar: string;
+  blockedIps?: string[];
+}
+
+export type SystemModelInfo = SystemConfigInfo &
+  Partial<NotificationInfo> &
+  LoginLogInfo &
+  Partial<NotifyLogInfo> &
+  Partial<AuthInfo>;
+
+export interface SystemInstance
+  extends Model<SystemInfo, SystemInfo>,
+    SystemInfo {}
+export const SystemModel = sequelize.define<SystemInstance>('Auth', {
+  ip: DataTypes.STRING,
+  type: DataTypes.STRING,
+  info: {
+    type: DataTypes.JSON,
+    allowNull: true,
+  },
+});

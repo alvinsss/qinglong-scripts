@@ -1,0 +1,290 @@
+import express, { Request, Response, NextFunction, Application } from 'express';
+import bodyParser from 'body-parser';
+import cors from 'cors';
+import routes from '../api';
+import config from '../config';
+import { UnauthorizedError, expressjwt } from 'express-jwt';
+import { getPlatform, getToken } from '../config/util';
+import rewrite from 'express-urlrewrite';
+import validationErrors from '../middlewares/validationErrors';
+import { serveEnv } from '../config/serverEnv';
+import { shareStore } from '../shared/store';
+import { isValidToken, isDefaultAuthInfo } from '../shared/auth';
+import { AuthInfo } from '../data/system';
+import path from 'path';
+import { t } from '../shared/i18n';
+import { AppScope } from '../data/open';
+import uniqueConstraintError from '../middlewares/uniqueConstraintError';
+import protectedPathCase from '../middlewares/protectedPathCase';
+import Logger from './logger';
+
+function resolveTrustProxy(value = process.env.QL_TRUST_PROXY) {
+  const setting = value?.trim();
+  if (!setting) {
+    return 'loopback';
+  }
+  if (setting === 'true' || setting === 'false') {
+    return setting === 'true';
+  }
+  if (/^\d+$/.test(setting)) {
+    return Number(setting);
+  }
+  return setting;
+}
+
+export default ({ app }: { app: Application }) => {
+  // Security: Enable strict routing to prevent case-insensitive path bypass
+  app.set('case sensitive routing', true);
+  app.set('strict routing', true);
+  app.set('trust proxy', resolveTrustProxy());
+  app.use(cors());
+
+  // Security: Reject case variations under protected API namespaces before
+  // authentication checks can interpret the request differently from routing.
+  app.use(protectedPathCase);
+
+  // Rewrite URLs to strip baseUrl prefix if configured
+  // This allows the rest of the app to work without baseUrl awareness
+  if (config.baseUrl) {
+    app.use(rewrite(`${config.baseUrl}/*`, '/$1'));
+  }
+
+  app.get(`${config.api.prefix}/env.js`, serveEnv);
+  app.use(
+    `${config.api.prefix}/static`,
+    express.static(config.uploadPath, {
+      setHeaders: (res) => {
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
+      },
+    }),
+  );
+
+  const credentialPaths = ['/api', '/open'].flatMap((prefix) =>
+    ['/user/login', '/user/init', '/user/two-factor/login'].map(
+      (route) => `${prefix}${route}`,
+    ),
+  );
+  app.use(
+    credentialPaths,
+    bodyParser.json({ limit: '16kb' }),
+    bodyParser.urlencoded({ limit: '16kb', extended: false }),
+  );
+
+  app.use(bodyParser.json({ limit: '50mb' }));
+  app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
+
+  const frontendPath = path.join(config.rootPath, 'static/dist');
+  app.use(express.static(frontendPath));
+
+  app.use(
+    expressjwt({
+      secret: config.jwt.secret,
+      algorithms: ['HS384'],
+    }).unless({
+      path: [...config.apiWhiteList, /^(\/(?!api\/).*)$/i],
+    }),
+  );
+
+  app.use((req: Request, res, next) => {
+    if (!req.headers) {
+      req.platform = 'desktop';
+    } else {
+      const platform = getPlatform(req.headers['user-agent'] || '');
+      req.platform = platform;
+    }
+    return next();
+  });
+
+  app.use(async (req: Request, res, next) => {
+    const pathLower = req.path.toLowerCase();
+    if (!['/open/', '/api/'].some((x) => pathLower.startsWith(x))) {
+      return next();
+    }
+
+    const headerToken = getToken(req);
+    if (pathLower.startsWith('/open/')) {
+      const apps = await shareStore.getApps();
+      const doc = apps?.filter((x) =>
+        x.tokens?.find((y) => y.value === headerToken),
+      )?.[0];
+      if (doc && doc.tokens && doc.tokens.length > 0) {
+        const currentToken = doc.tokens.find((x) => x.value === headerToken);
+        const keyMatch = pathLower.match(/\/open\/([a-z]+)\/*/);
+        const key = keyMatch && keyMatch[1];
+
+        const isReadRequest =
+          (['GET', 'HEAD'].includes(req.method) &&
+            !(
+              key === 'crons' && /^\/open\/crons\/import\/?$/.test(pathLower)
+            )) ||
+          (['scripts', 'logs'].includes(key || '') &&
+            req.method === 'POST' &&
+            /^\/open\/(?:scripts|logs)\/download\/?$/.test(pathLower));
+        const hasNamespaceScope =
+          doc.scopes.includes(key as AppScope) ||
+          ([
+            'crons',
+            'subscriptions',
+            'envs',
+            'configs',
+            'scripts',
+            'logs',
+            'dependencies',
+            'dashboard',
+          ].includes(key || '') &&
+            doc.scopes.includes(`${key}:read` as AppScope) &&
+            isReadRequest);
+        if (!hasNamespaceScope) {
+          const err = new UnauthorizedError('credentials_bad_scheme', {
+            message: t('暂无权限'),
+          });
+          return next(err);
+        }
+
+        // The built-in system app still needs its local CLI maintenance API.
+        const appRouteAllowed =
+          key !== 'system' ||
+          doc.name === 'system' ||
+          ((req.method === 'GET' || req.method === 'HEAD') &&
+            (pathLower === '/open/system' || pathLower === '/open/system/')) ||
+          (req.method === 'PUT' && pathLower === '/open/system/notify');
+        if (!appRouteAllowed) {
+          const err = new UnauthorizedError('credentials_bad_scheme', {
+            message: t('暂无权限'),
+          });
+          return next(err);
+        }
+
+        if (
+          !currentToken ||
+          currentToken.expiration < Math.round(Date.now() / 1000)
+        ) {
+          const err = new UnauthorizedError('invalid_token', {
+            message: t('Token 已失效'),
+          });
+          return next(err);
+        }
+
+        return next();
+      }
+    }
+
+    const originPath = `${req.baseUrl}${pathLower === '/' ? '' : pathLower}`;
+    if (
+      !headerToken &&
+      originPath &&
+      config.apiWhiteList.includes(originPath)
+    ) {
+      return next();
+    }
+
+    const authInfo = await shareStore.getAuthInfo();
+    if (isValidToken(authInfo, headerToken, req.platform, config.jwt.secret)) {
+      return next();
+    }
+
+    const errorCode = headerToken ? 'invalid_token' : 'credentials_required';
+    const errorMessage = headerToken ? t('Token 已失效') : t('请先登录');
+    const err = new UnauthorizedError(errorCode, { message: errorMessage });
+    next(err);
+  });
+
+  app.use(async (req, res, next) => {
+    const pathLower = req.path.toLowerCase();
+    if (!['/api/user/init', '/open/user/init'].includes(pathLower)) {
+      return next();
+    }
+    const authInfo = (await shareStore.getAuthInfo()) || ({} as AuthInfo);
+
+    let isInitialized = !isDefaultAuthInfo(authInfo);
+
+    if (isInitialized) {
+      return res.send({ code: 450, message: t('未知错误') });
+    } else {
+      return next();
+    }
+  });
+
+  app.use(rewrite('/open/*', '/api/$1'));
+  app.use(config.api.prefix, routes());
+
+  app.get('*', (req, res, next) => {
+    // Don't serve index.html for API routes
+    if (
+      req.path === config.api.prefix ||
+      req.path.startsWith(`${config.api.prefix}/`)
+    ) {
+      return res.status(404).json({ code: 404, message: 'Not Found' });
+    }
+    const indexPath = path.join(frontendPath, 'index.html');
+    res.sendFile(indexPath, (err) => {
+      if (err) {
+        const err: any = new Error('Not Found');
+        err['status'] = 404;
+        next(err);
+      }
+    });
+  });
+
+  app.use(validationErrors);
+  app.use(uniqueConstraintError);
+
+  app.use(
+    (
+      err: Error & { status: number; code?: string },
+      req: Request,
+      res: Response,
+      next: NextFunction,
+    ) => {
+      if (err.name === 'UnauthorizedError') {
+        let message = err.message;
+        if (!config.isDevelopment) {
+          if (err.code === 'credentials_bad_scheme') {
+            message = t('暂无权限');
+          } else if (err.code === 'credentials_required') {
+            message = t('请先登录');
+          } else {
+            message = t('Token 已失效');
+          }
+        }
+        return res.status(401).send({ code: 401, message }).end();
+      }
+      return next(err);
+    },
+  );
+
+  app.use(
+    (
+      err: Error & { status: number },
+      req: Request,
+      res: Response,
+      next: NextFunction,
+    ) => {
+      const status =
+        Number.isInteger(err.status) && err.status >= 400 && err.status < 600
+          ? err.status
+          : 500;
+      if (status >= 500) {
+        const route =
+          typeof req.route?.path === 'string' ? req.route.path : '?';
+        const errorName = /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(err.name)
+          ? err.name
+          : 'Error';
+        Logger.error(
+          'HTTP request failed: status=%d method=%s route=%s type=%s',
+          status,
+          req.method,
+          route,
+          errorName,
+        );
+      }
+      res.status(status);
+      res.json({
+        code: status,
+        message:
+          !config.isDevelopment && status >= 500 ? t('未知错误') : err.message,
+      });
+    },
+  );
+};
