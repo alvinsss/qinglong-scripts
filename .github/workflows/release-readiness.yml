@@ -1,0 +1,171 @@
+name: Release readiness
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release-readiness.yml'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'docker/Dockerfile*'
+      - 'shell/node-runtime-probe.cjs'
+      - 'scripts/verify-panel-package.cjs'
+      - 'scripts/verify-image-node-layers.py'
+      - 'test/back/node-runtime-probe.test.cjs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-readiness-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    uses: ./.github/workflows/validate.yml
+
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: pnpm/action-setup@v6
+        with:
+          version: '8.3.1'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:front && pnpm build:back && pnpm build:info
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-readiness-static
+          path: static/
+          include-hidden-files: true
+          if-no-files-found: error
+      - name: Pack the verified npm archive for isolated runtime validation
+        run: node scripts/verify-panel-package.cjs pack "$RUNNER_TEMP/npm-panel"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-readiness-npm-panel
+          path: ${{ runner.temp }}/npm-panel/
+          if-no-files-found: error
+
+  images:
+    needs: [regression, static]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: alpine
+            file: docker/Dockerfile
+            cache: alpine
+            platforms: linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/ppc64le,linux/s390x,linux/386
+          - image: debian
+            file: docker/Dockerfile.debian
+            cache: debian
+            platforms: linux/amd64,linux/arm64,linux/ppc64le,linux/s390x
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record source
+        id: source
+        env:
+          SOURCE_URL: ${{ github.event.pull_request.head.repo.clone_url || format('https://github.com/{0}.git', github.repository) }}
+          SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "url=$SOURCE_URL" >> "$GITHUB_OUTPUT"
+          echo "branch=$SOURCE_BRANCH" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-readiness-static
+          path: static/
+      - uses: docker/setup-qemu-action@v4
+        with:
+          cache-image: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Build every release architecture
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          platforms: ${{ matrix.platforms }}
+          build-args: |
+            QL_URL=${{ steps.source.outputs.url }}
+            QL_BRANCH=${{ steps.source.outputs.branch }}
+            SOURCE_COMMIT=${{ steps.source.outputs.sha }}
+          push: false
+          provenance: false
+          sbom: false
+          cache-from: type=registry,ref=whyour/qinglong:cache-${{ matrix.cache }}
+      - name: Load native image for runtime verification
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          platforms: linux/amd64
+          build-args: |
+            QL_URL=${{ steps.source.outputs.url }}
+            QL_BRANCH=${{ steps.source.outputs.branch }}
+            SOURCE_COMMIT=${{ steps.source.outputs.sha }}
+          tags: qinglong-readiness:${{ matrix.image }}
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+      - name: Verify native production runtime without external networking
+        run: |
+          docker run --rm --network none --entrypoint node \
+            qinglong-readiness:${{ matrix.image }} \
+            -e 'const assert=require("node:assert/strict"); const {createRequire}=require("node:module"); for(const [name,want] of Object.entries({"@grpc/grpc-js":"1.14.5",compression:"1.8.2",multer:"2.4.0",sequelize:"6.37.8"}))assert.equal(require(name+"/package.json").version,want); const expressRequire=createRequire(require.resolve("express")); assert.equal(expressRequire("proxy-addr/package.json").version,"2.0.8"); const sockRequire=createRequire(require.resolve("sockjs")); assert.equal(sockRequire("websocket-driver/package.json").version,"0.7.5"); require("sqlite3"); require("nodemailer"); require("undici"); console.log("Minimal production patches and runtime imports verified")'
+      - name: Load ARMv6 image for SQLite and Node regression checks
+        if: startsWith(matrix.image, 'alpine')
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          platforms: linux/arm/v6
+          build-args: |
+            QL_URL=${{ steps.source.outputs.url }}
+            QL_BRANCH=${{ steps.source.outputs.branch }}
+            SOURCE_COMMIT=${{ steps.source.outputs.sha }}
+          tags: qinglong-readiness:${{ matrix.image }}-armv6
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+      - name: Verify ARMv6 SQLite on an ARM1176 CPU without networking
+        if: startsWith(matrix.image, 'alpine')
+        run: |
+          docker run --rm --network none --platform linux/arm/v6 \
+            -e QEMU_CPU=arm1176 --entrypoint node \
+            qinglong-readiness:${{ matrix.image }}-armv6 --jitless \
+            -e 'const assert=require("node:assert/strict"); const sqlite3=require("sqlite3"); const db=new sqlite3.Database(":memory:"); db.get("SELECT 42 AS n",(error,row)=>{assert.ifError(error); assert.equal(row.n,42); db.close()});'
+      - name: Check Node binaries in every serialized image layer
+        if: startsWith(matrix.image, 'alpine')
+        run: |
+          docker save qinglong-readiness:${{ matrix.image }} -o "$RUNNER_TEMP/node-layers-amd64.tar"
+          docker save qinglong-readiness:${{ matrix.image }}-armv6 -o "$RUNNER_TEMP/node-layers-arm.tar"
+          python3 scripts/verify-image-node-layers.py "$RUNNER_TEMP/node-layers-amd64.tar" amd64
+          python3 scripts/verify-image-node-layers.py "$RUNNER_TEMP/node-layers-arm.tar" arm
+          rm "$RUNNER_TEMP/node-layers-amd64.tar" "$RUNNER_TEMP/node-layers-arm.tar"
+      - name: Export native image for isolated dev validation
+        if: matrix.image == 'debian' || matrix.image == 'alpine'
+        run: |
+          docker save qinglong-readiness:${{ matrix.image }} | gzip -1 > release-readiness-${{ matrix.image }}-image.tar.gz
+          sha256sum release-readiness-${{ matrix.image }}-image.tar.gz > release-readiness-${{ matrix.image }}-image.sha256
+          docker image inspect qinglong-readiness:${{ matrix.image }} > release-readiness-${{ matrix.image }}-image.json
+      - uses: actions/upload-artifact@v6
+        if: matrix.image == 'debian' || matrix.image == 'alpine'
+        with:
+          name: release-readiness-${{ matrix.image }}-image
+          path: release-readiness-${{ matrix.image }}-image.*
+          compression-level: 0
+          if-no-files-found: error
