@@ -1,0 +1,614 @@
+import { Service, Inject } from 'typedi';
+import winston from 'winston';
+import config from '../config';
+import {
+  Dependence,
+  DependenceStatus,
+  DependenceTypes,
+  DependenceModel,
+  versionDependenceCommandTypes,
+} from '../data/dependence';
+import { spawn } from 'cross-spawn';
+import SockService from './sock';
+import { FindOptions, Op } from 'sequelize';
+import {
+  fileExist,
+  getPid,
+  killTask,
+  promiseExecSuccess,
+  concurrentRun,
+  getInstallCommand,
+  getUninstallCommand,
+  getGetCommand,
+  isPythonSourceDependency,
+} from '../config/util';
+import dayjs from 'dayjs';
+import taskLimit from '../shared/pLimit';
+import { detectOS } from '../config/util';
+import { LINUX_DEPENDENCE_COMMAND } from '../config/const';
+import { t, tf } from '../shared/i18n';
+import { randomUUID } from 'crypto';
+
+type RefreshType = 'nodejs' | 'python3';
+type RefreshJob = {
+  id: string;
+  type: RefreshType;
+  state: 'running' | 'completed' | 'failed';
+};
+
+@Service()
+export default class DependenceService {
+  private activeRefreshJob?: RefreshJob;
+  private refreshJobs = new Map<string, RefreshJob>();
+
+  constructor(
+    @Inject('logger') private logger: winston.Logger,
+    private sockService: SockService,
+  ) {}
+
+  public async create(payloads: Dependence[]): Promise<Dependence[]> {
+    const tabs = payloads.map((x) => {
+      getInstallCommand(x.type, x.name);
+      const tab = new Dependence({ ...x, status: DependenceStatus.queued });
+      return tab;
+    });
+    const docs = await this.insert(tabs);
+    this.installDependenceOneByOne(docs);
+    return docs;
+  }
+
+  public async insert(payloads: Dependence[]): Promise<Dependence[]> {
+    const docs = await DependenceModel.bulkCreate(payloads);
+    return docs;
+  }
+
+  public async update(
+    payload: Dependence & { id: string },
+  ): Promise<Dependence> {
+    const { id, ...other } = payload;
+    const doc = await this.getDb({ id });
+    const tab = new Dependence({
+      ...doc,
+      ...other,
+      status: DependenceStatus.queued,
+    });
+    getInstallCommand(tab.type, tab.name);
+    const newDoc = await this.updateDb(tab);
+    this.installDependenceOneByOne([newDoc]);
+    return newDoc;
+  }
+
+  private async updateDb(payload: Dependence): Promise<Dependence> {
+    await DependenceModel.update(payload, { where: { id: payload.id } });
+    return await this.getDb({ id: payload.id });
+  }
+
+  public async remove(ids: number[], force = false): Promise<Dependence[]> {
+    const docs = await DependenceModel.findAll({ where: { id: ids } });
+    for (const doc of docs) {
+      taskLimit.removeQueuedDependency(doc);
+    }
+    const installedDeps = docs.filter(
+      (x) =>
+        x.status === DependenceStatus.installed ||
+        // Older list refreshes marked unprobeable sources as failed. They may
+        // still have installed distributions (including partial pip installs).
+        (x.status === DependenceStatus.installFailed &&
+          x.type === DependenceTypes.python3 &&
+          isPythonSourceDependency(x.name)),
+    );
+    const unInstalledDeps = docs.filter((x) => !installedDeps.includes(x));
+    await this.removeDb(unInstalledDeps.map((x) => x.id!));
+
+    if (installedDeps.length) {
+      await DependenceModel.update(
+        { status: DependenceStatus.queued, log: [] },
+        { where: { id: installedDeps.map((x) => x.id!) } },
+      );
+
+      this.installDependenceOneByOne(installedDeps, false, force);
+    }
+    return docs;
+  }
+
+  public async removeDb(ids: number[]) {
+    await DependenceModel.destroy({ where: { id: ids } });
+  }
+
+  public async dependencies(
+    {
+      searchValue,
+      type,
+      status,
+    }: {
+      searchValue: string;
+      type: keyof typeof DependenceTypes;
+      status: string;
+    },
+    sort: any = [],
+    query: any = {},
+  ): Promise<Dependence[]> {
+    let condition = query;
+    if (type && DependenceTypes[type] !== undefined) {
+      condition.type = DependenceTypes[type];
+    }
+    if (status) {
+      condition.status = status.split(',').map(Number);
+    }
+    if (searchValue) {
+      const encodeText = encodeURI(searchValue);
+      condition.name = {
+        [Op.or]: [
+          { [Op.like]: `%${searchValue}%` },
+          { [Op.like]: `%${encodeText}%` },
+        ],
+      };
+    }
+    try {
+      return await this.find(condition, sort);
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  public startRefresh(type: RefreshType): {
+    job: RefreshJob;
+    accepted: boolean;
+  } {
+    if (this.activeRefreshJob) {
+      return {
+        job: this.activeRefreshJob,
+        accepted: this.activeRefreshJob.type === type,
+      };
+    }
+
+    const job: RefreshJob = { id: randomUUID(), type, state: 'running' };
+    this.activeRefreshJob = job;
+    this.refreshJobs.set(job.id, job);
+    while (this.refreshJobs.size > 20) {
+      const oldestId = this.refreshJobs.keys().next().value;
+      this.refreshJobs.delete(oldestId);
+    }
+
+    void this.refreshInstalledStatuses(DependenceTypes[type])
+      .then(() => {
+        job.state = 'completed';
+      })
+      .catch((error) => {
+        this.logger.error('Dependency refresh failed: %o', error);
+        job.state = 'failed';
+      })
+      .finally(() => {
+        if (this.activeRefreshJob === job) {
+          this.activeRefreshJob = undefined;
+        }
+      });
+
+    return { job, accepted: true };
+  }
+
+  public getRefreshJob(id: string): RefreshJob | undefined {
+    return this.refreshJobs.get(id);
+  }
+
+  public getActiveRefreshJob(): RefreshJob | undefined {
+    return this.activeRefreshJob?.state === 'running'
+      ? this.activeRefreshJob
+      : undefined;
+  }
+
+  private async refreshInstalledStatuses(type?: DependenceTypes) {
+    const cacheDependenceTypes = [
+      DependenceTypes.nodejs,
+      DependenceTypes.python3,
+    ];
+    if (type !== undefined && !cacheDependenceTypes.includes(type)) {
+      return;
+    }
+
+    const docs = await DependenceModel.findAll({
+      where: {
+        status: DependenceStatus.installed,
+        type: type === undefined ? { [Op.in]: cacheDependenceTypes } : type,
+      },
+    });
+    const checkableDocs = docs.filter(
+      (doc) =>
+        doc.type !== DependenceTypes.python3 ||
+        !isPythonSourceDependency(doc.name),
+    );
+    const checks = await concurrentRun(
+      checkableDocs.map((doc) => async () => this.isDependenceInstalled(doc)),
+      5,
+    );
+
+    for (const [index, installed] of (checks || []).entries()) {
+      if (installed) continue;
+      const doc = checkableDocs[index];
+      await DependenceModel.update(
+        { status: DependenceStatus.installFailed },
+        {
+          where: {
+            id: doc.id,
+            status: DependenceStatus.installed,
+            name: doc.name,
+            type: doc.type,
+            updatedAt: (doc as typeof doc & { updatedAt: Date }).updatedAt,
+            // Sequelize's automatic timestamp is absent from Dependence's attribute type.
+          } as any,
+        },
+      );
+    }
+  }
+
+  private async isDependenceInstalled(dependency: Dependence) {
+    let depName = dependency.name.trim();
+    const depVersionStr = versionDependenceCommandTypes[dependency.type];
+    let depVersion = '';
+    if (
+      dependency.type !== DependenceTypes.python3 &&
+      depName.includes(depVersionStr)
+    ) {
+      const symbolRegx = new RegExp(
+        `(.*)${depVersionStr}([0-9\\.\\-\\+a-zA-Z]*)`,
+      );
+      const [, parsedName, parsedVersion] = depName.match(symbolRegx) || [];
+      if (parsedVersion && parsedName) {
+        depName = parsedName;
+        depVersion = parsedVersion;
+      }
+    }
+
+    const depInfo = (
+      await promiseExecSuccess(getGetCommand(dependency.type, depName))
+    )
+      .replace(/\s{2,}/, ' ')
+      .replace(/\s+$/, '');
+    const nameMatches =
+      (dependency.type === DependenceTypes.nodejs &&
+        depInfo.split(' ')?.[0] === depName) ||
+      dependency.type === DependenceTypes.python3;
+
+    return Boolean(
+      depInfo && nameMatches && (!depVersion || depInfo.includes(depVersion)),
+    );
+  }
+
+  public installDependenceOneByOne(
+    docs: Dependence[],
+    isInstall: boolean = true,
+    force: boolean = false,
+  ): Promise<void> {
+    docs.forEach((dep) => {
+      this.installOrUninstallDependency(dep, isInstall, force);
+    });
+
+    return taskLimit.waitDependencyQueueDone();
+  }
+
+  public async reInstall(ids: number[]): Promise<Dependence[]> {
+    await DependenceModel.update(
+      { status: DependenceStatus.queued, log: [] },
+      { where: { id: ids } },
+    );
+
+    const docs = await DependenceModel.findAll({ where: { id: ids } });
+    for (const doc of docs) {
+      taskLimit.removeQueuedDependency(doc);
+    }
+    this.installDependenceOneByOne(docs, true, true);
+    return docs;
+  }
+
+  public async cancel(ids: number[]) {
+    const docs = await DependenceModel.findAll({ where: { id: ids } });
+    for (const doc of docs) {
+      taskLimit.removeQueuedDependency(doc);
+      let depInstallCommand = getInstallCommand(doc.type, doc.name);
+      let depUnInstallCommand = getUninstallCommand(doc.type, doc.name);
+      const isLinuxDependence = doc.type === DependenceTypes.linux;
+
+      if (isLinuxDependence) {
+        const osType = await detectOS();
+        if (!osType) {
+          continue;
+        }
+        const linuxCommand = LINUX_DEPENDENCE_COMMAND[osType];
+        depInstallCommand = `${linuxCommand.install} ${doc.name.trim()}`;
+        depUnInstallCommand = `${linuxCommand.uninstall} ${doc.name.trim()}`;
+      }
+      const pids = await Promise.all([
+        getPid(depInstallCommand),
+        getPid(depUnInstallCommand),
+      ]);
+      for (const pid of pids) {
+        pid && (await killTask(pid));
+      }
+    }
+    await DependenceModel.update(
+      { status: DependenceStatus.cancelled },
+      { where: { id: ids } },
+    );
+  }
+
+  private async find(query: any, sort: any = []): Promise<Dependence[]> {
+    const docs = await DependenceModel.findAll({
+      where: { ...query },
+      order: [...sort, ['createdAt', 'DESC']],
+    });
+    return docs;
+  }
+
+  public async getDb(
+    query: FindOptions<Dependence>['where'],
+  ): Promise<Dependence> {
+    const doc: any = await DependenceModel.findOne({ where: { ...query } });
+    if (!doc) {
+      throw new Error(`Dependency ${JSON.stringify(query)} not found`);
+    }
+    return doc.get({ plain: true });
+  }
+
+  private async updateLog(ids: number[], log: string): Promise<void> {
+    taskLimit.updateDepLog(async () => {
+      const docs = await DependenceModel.findAll({ where: { id: ids } });
+      for (const doc of docs) {
+        const newLog = doc?.log ? [...doc.log, log] : [log];
+        await DependenceModel.update(
+          { log: newLog },
+          { where: { id: doc.id } },
+        );
+      }
+      return null;
+    });
+  }
+
+  public installOrUninstallDependency(
+    dependency: Dependence,
+    isInstall: boolean = true,
+    force: boolean = false,
+  ) {
+    return taskLimit.runDependeny(dependency, () => {
+      let validatedCommand: string;
+      try {
+        validatedCommand = isInstall
+          ? getInstallCommand(dependency.type, dependency.name.trim())
+          : getUninstallCommand(dependency.type, dependency.name.trim());
+      } catch (error) {
+        taskLimit.removeQueuedDependency(dependency);
+        if (!isInstall && force) {
+          return this.removeDb([dependency.id!]).then(() => null);
+        }
+        return DependenceModel.update(
+          {
+            status: isInstall
+              ? DependenceStatus.installFailed
+              : DependenceStatus.removeFailed,
+            log: [String(error)],
+          },
+          { where: { id: dependency.id } },
+        ).then(() => null);
+      }
+      return new Promise(async (resolve) => {
+        if (taskLimit.firstDependencyId !== dependency.id) {
+          return resolve(null);
+        }
+        const depIds = [dependency.id!];
+        let depName = dependency.name.trim();
+        const actionText = isInstall ? t('安装') : t('删除');
+        const socketMessageType = isInstall
+          ? 'installDependence'
+          : 'uninstallDependence';
+        const isNodeDependence = dependency.type === DependenceTypes.nodejs;
+        const isLinuxDependence = dependency.type === DependenceTypes.linux;
+        const isPythonDependence = dependency.type === DependenceTypes.python3;
+        const osType = await detectOS();
+        let linuxCommand = {} as typeof LINUX_DEPENDENCE_COMMAND.Alpine;
+        taskLimit.removeQueuedDependency(dependency);
+        if (isLinuxDependence) {
+          if (!osType) {
+            await DependenceModel.update(
+              { status: DependenceStatus.installFailed },
+              { where: { id: depIds } },
+            );
+            const startTime = dayjs();
+            const message = tf(
+              '开始%s依赖 %s，开始时间 %s\n\n当前系统不支持\n\n依赖%s失败，结束时间 %s，耗时 %s 秒',
+              actionText,
+              depName,
+              startTime.format('YYYY-MM-DD HH:mm:ss'),
+              actionText,
+              startTime.format('YYYY-MM-DD HH:mm:ss'),
+              String(startTime.diff(startTime, 'second')),
+            );
+            this.sockService.sendMessage({
+              type: socketMessageType,
+              message,
+              references: depIds,
+              status: DependenceStatus.installFailed,
+            });
+            this.updateLog(depIds, message);
+            return resolve(null);
+          }
+          linuxCommand = LINUX_DEPENDENCE_COMMAND[osType];
+        }
+
+        const status = isInstall
+          ? DependenceStatus.installing
+          : DependenceStatus.removing;
+        await DependenceModel.update({ status }, { where: { id: depIds } });
+
+        let command = validatedCommand;
+        if (isLinuxDependence) {
+          command = isInstall
+            ? `${linuxCommand.install} ${depName.trim()}`
+            : `${linuxCommand.uninstall} ${depName.trim()}`;
+        }
+        const startTime = dayjs();
+
+        const message = tf(
+          '开始%s依赖 %s，开始时间 %s\n\n',
+          actionText,
+          depName,
+          startTime.format('YYYY-MM-DD HH:mm:ss'),
+        );
+        this.sockService.sendMessage({
+          type: socketMessageType,
+          message,
+          references: depIds,
+          status,
+        });
+        this.updateLog(depIds, message);
+
+        // 判断是否已经安装过依赖
+        // pip must resolve optional dependencies even if the base distribution
+        // is already present; its version alone cannot prove extras are ready.
+        if (
+          isInstall &&
+          !force &&
+          !(isPythonDependence && depName.includes('['))
+        ) {
+          let getCommand = getGetCommand(dependency.type, depName);
+          const depVersionStr = versionDependenceCommandTypes[dependency.type];
+          if (isLinuxDependence) {
+            getCommand = `${linuxCommand.info} ${depName}`;
+          }
+
+          let depVersion = '';
+          if (!isPythonDependence && depName.includes(depVersionStr)) {
+            const symbolRegx = new RegExp(
+              `(.*)${depVersionStr}([0-9\\.\\-\\+a-zA-Z]*)`,
+            );
+            const [, _depName, _depVersion] = depName.match(symbolRegx) || [];
+            if (_depVersion && _depName) {
+              depName = _depName;
+              depVersion = _depVersion;
+            }
+          }
+          const depInfo = (await promiseExecSuccess(getCommand))
+            .replace(/\s{2,}/, ' ')
+            .replace(/\s+$/, '');
+
+          if (
+            depInfo &&
+            ((isNodeDependence && depInfo.split(' ')?.[0] === depName) ||
+              (isLinuxDependence &&
+                linuxCommand.check(depInfo.toLocaleLowerCase())) ||
+              isPythonDependence) &&
+            (!depVersion || depInfo.includes(depVersion))
+          ) {
+            const endTime = dayjs();
+            const _message = tf(
+              '检测到已经安装 %s\n\n%s\n\n跳过安装\n\n依赖%s成功，结束时间 %s，耗时 %s 秒',
+              depName,
+              depInfo,
+              actionText,
+              endTime.format('YYYY-MM-DD HH:mm:ss'),
+              String(endTime.diff(startTime, 'second')),
+            );
+            this.sockService.sendMessage({
+              type: socketMessageType,
+              message: _message,
+              references: depIds,
+              status: DependenceStatus.installed,
+            });
+            this.updateLog(depIds, _message);
+            await DependenceModel.update(
+              { status: DependenceStatus.installed },
+              { where: { id: depIds } },
+            );
+            return resolve(null);
+          }
+        }
+        const dependenceProxyFileExist = await fileExist(
+          config.dependenceProxyFile,
+        );
+        const proxyStr = dependenceProxyFileExist
+          ? `source ${config.dependenceProxyFile} &&`
+          : '';
+        const cp = spawn(`${proxyStr} ${command}`, {
+          shell: '/bin/bash',
+        });
+
+        cp.stdout.on('data', async (data) => {
+          this.sockService.sendMessage({
+            type: socketMessageType,
+            message: data.toString(),
+            references: depIds,
+            status,
+          });
+          this.updateLog(depIds, data.toString());
+        });
+
+        cp.stderr.on('data', async (data) => {
+          this.sockService.sendMessage({
+            type: socketMessageType,
+            message: data.toString(),
+            references: depIds,
+            status,
+          });
+          this.updateLog(depIds, data.toString());
+        });
+
+        cp.on('error', async (err) => {
+          this.sockService.sendMessage({
+            type: socketMessageType,
+            message: JSON.stringify(err),
+            references: depIds,
+            status,
+          });
+          this.updateLog(depIds, JSON.stringify(err));
+        });
+
+        cp.on('exit', async (code) => {
+          const endTime = dayjs();
+          const isSucceed = code === 0;
+          const resultText = isSucceed ? t('成功') : t('失败');
+
+          const message =
+            '\n' +
+            tf(
+              '依赖%s%s，结束时间 %s，耗时 %s 秒',
+              actionText,
+              resultText,
+              endTime.format('YYYY-MM-DD HH:mm:ss'),
+              String(endTime.diff(startTime, 'second')),
+            );
+          const exitStatus = isSucceed
+            ? isInstall
+              ? DependenceStatus.installed
+              : DependenceStatus.removed
+            : isInstall
+            ? DependenceStatus.installFailed
+            : DependenceStatus.removeFailed;
+          this.sockService.sendMessage({
+            type: socketMessageType,
+            message,
+            references: depIds,
+            status: exitStatus,
+          });
+          this.updateLog(depIds, message);
+
+          const docs = await DependenceModel.findAll({ where: { id: depIds } });
+          const _docIds = docs
+            .filter((x) => x.status !== DependenceStatus.cancelled)
+            .map((x) => x.id!);
+
+          if (_docIds.length > 0) {
+            await DependenceModel.update(
+              { status: exitStatus },
+              { where: { id: _docIds } },
+            );
+          }
+
+          // 如果删除依赖成功或者强制删除
+          if ((isSucceed || force) && !isInstall) {
+            this.removeDb(depIds);
+          }
+
+          resolve(null);
+        });
+      });
+    });
+  }
+}

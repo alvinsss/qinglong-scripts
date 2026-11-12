@@ -1,0 +1,71 @@
+import { Service } from 'typedi';
+import Logger from '../loaders/logger';
+import cronClient from '../schedule/client';
+import { HttpServerService } from './http';
+import { runtimeBuild } from '../shared/runtimeBuild';
+
+interface HealthStatus {
+  build: typeof runtimeBuild;
+  status: 'ok' | 'error';
+  services: {
+    http: boolean;
+    grpc: boolean;
+  };
+  metrics: {
+    uptime: number;
+    memory: {
+      used: number;
+      total: number;
+    };
+  };
+}
+
+@Service()
+export class HealthService {
+  private startTime = Date.now();
+
+  constructor(private httpServerService: HttpServerService) {}
+
+  async check(): Promise<HealthStatus> {
+    const status: HealthStatus = {
+      build: runtimeBuild,
+      status: 'ok',
+      services: {
+        http: true,
+        grpc: true,
+      },
+      metrics: {
+        uptime: Math.floor((Date.now() - this.startTime) / 1000),
+        memory: {
+          used: process.memoryUsage().heapUsed,
+          total: process.memoryUsage().heapTotal,
+        },
+      },
+    };
+
+    try {
+      const httpServer = this.httpServerService.getServer();
+      if (!httpServer) {
+        status.services.http = false;
+        status.status = 'error';
+      }
+    } catch (err) {
+      status.services.http = false;
+      status.status = 'error';
+      Logger.error('HTTP server check failed:', err);
+    }
+
+    try {
+      if (!(await cronClient.readiness.check())) {
+        status.services.grpc = false;
+        status.status = 'error';
+      }
+    } catch (err) {
+      status.services.grpc = false;
+      status.status = 'error';
+      Logger.error('gRPC server check failed:', err);
+    }
+
+    return status;
+  }
+}
