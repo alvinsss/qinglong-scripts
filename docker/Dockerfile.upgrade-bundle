@@ -1,0 +1,16 @@
+# The image digest is supplied by the same workflow run, never a rolling tag.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS bundle
+ARG BASE_IMAGE
+ENV QL_BUNDLE_BASE_IMAGE=${BASE_IMAGE}
+ARG TARGETARCH
+ARG TARGETVARIANT
+USER root
+RUN ulimit -c 0; \
+    if [ "$TARGETARCH/$TARGETVARIANT" = arm/v6 ]; then \
+      export QEMU_CPU=arm1176; \
+      set -- --jitless; \
+    fi; \
+    node "$@" /ql/scripts/build-upgrade-bundle.cjs /ql /out
+FROM scratch
+COPY --from=bundle /out/ /
