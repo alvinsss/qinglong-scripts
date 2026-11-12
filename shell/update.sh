@@ -1,0 +1,591 @@
+#!/usr/bin/env bash
+
+dir_shell=$QL_DIR/shell
+. "$dir_shell/share.sh"
+. "$dir_shell/api.sh"
+load_ql_envs
+. "$dir_shell/env.sh"
+
+send_mark=$dir_shell/send_mark
+
+## 检测cron的差异，$1：脚本清单文件路径，$2：cron任务清单文件路径，$3：增加任务清单文件路径，$4：删除任务清单文件路径
+diff_cron() {
+  local list_scripts="$1"
+  local list_task="$2"
+  local list_add="$3"
+  local list_drop="$4"
+  if [[ -s $list_task ]] && [[ -s $list_scripts ]]; then
+    grep -vwf $list_task $list_scripts >$list_add
+    grep -vwf $list_scripts $list_task >$list_drop
+  fi
+
+  if [[ ! -s $list_task ]] && [[ -s $list_scripts ]]; then
+    cp -f $list_scripts $list_add
+  fi
+
+  if [[ ! -s $list_scripts ]] && [[ -s $list_task ]]; then
+    cp -f $list_task $list_drop
+  fi
+}
+
+## 输出是否有新的或失效的定时任务，$1：新的或失效的任务清单文件路径，$2：新/失效
+output_list_add_drop() {
+  local list=$1
+  local type=$(t "$2")
+  if [[ -s $list ]]; then
+    t '检测到有%s的定时任务:' "$type"
+    cat $list
+  fi
+}
+
+## 自动删除失效的脚本与定时任务，需要：1.AutoDelCron 设置为 true；2.正常更新js脚本，没有报错；3.存在失效任务
+## $1：失效任务清单文件路径
+del_cron() {
+  local list_drop=$1
+  local path=$2
+  local detail=""
+  local ids=""
+  t '\n开始尝试自动删除失效的定时任务...'
+  for cron in $(cat $list_drop); do
+    local id=$(cat $list_crontab_user | grep -E "$cmd_task.* $cron" | perl -pe "s|.*ID=(.*) $cmd_task.* $cron\.*|\1|" | head -1 | awk -F " " '{print $1}')
+    if [[ $ids ]]; then
+      ids="$ids,\"$id\""
+    else
+      ids="\"$id\""
+    fi
+    cron_file="$dir_scripts/${cron}"
+    if [[ -f $cron_file ]]; then
+      cron_name=$(grep "new Env" $cron_file | awk -F "\(" '{print $2}' | awk -F "\)" '{print $1}' | sed 's:.*\('\''\|"\)\([^"'\'']*\)\('\''\|"\).*:\2:' | sed 's:"::g' | sed "s:'::g" | head -1)
+      rm -f $cron_file
+    fi
+    [[ -z $cron_name ]] && cron_name="$cron"
+    if [[ $detail ]]; then
+      detail="${detail}\n${cron_name}"
+    else
+      detail="${cron_name}"
+    fi
+  done
+  if [[ $ids ]]; then
+    result=$(del_cron_api "$ids")
+    notify_api "$(t '%s 删除任务%s' "$path" "$result")" "$detail"
+  fi
+}
+
+## 自动增加定时任务，需要：1.AutoAddCron 设置为 true；2.正常更新js脚本，没有报错；3.存在新任务；4.crontab.list存在并且不为空
+## $1：新任务清单文件路径
+add_cron() {
+  local list_add=$1
+  local path=$2
+  t '\n开始尝试自动添加定时任务...'
+  local detail=""
+  cd $dir_scripts
+  for file in $(cat $list_add); do
+    local file_name=${file/${path}\//}
+    file_name=${file_name/${path}\_/}
+    if [[ -f $file ]]; then
+      cron_line=$(
+        perl -ne "{
+                        print if /.*([\d\*]*[\*-\/,\d]*[\d\*] ){4,5}[\d\*]*[\*-\/,\d]*[\d\*]( |,|\").*$file_name/
+                    }" $file 2>/dev/null |
+          perl -pe "{
+                        s|[^\d\*]*(([\d\*]*[\*-\/,\d]*[\d\*] ){4,5}[\d\*]*[\*-\/,\d]*[\d\*])( \|,\|\").*/?$file_name.*|\1|g;
+                        s|\*([\d\*])(.*)|\1\2|g;
+                        s|  | |g;
+                    }" 2>/dev/null | sort -u | head -1
+      )
+      [[ -z $cron_line ]] && cron_line=$(grep "cron:" $file | awk -F ":" '{print $2}' | head -1 | xargs)
+      [[ -z $cron_line ]] && cron_line=$(grep "cron " $file | awk -F "cron \"" '{print $2}' | awk -F "\" " '{print $1}' | head -1 | xargs)
+      [[ -z $cron_line ]] && cron_line="$default_cron"
+      cron_name=$(grep "new Env" $file | awk -F "\(" '{print $2}' | awk -F "\)" '{print $1}' | sed 's:.*\('\''\|"\)\([^"'\'']*\)\('\''\|"\).*:\2:' | sed 's:"::g' | sed "s:'::g" | head -1)
+      [[ -z $cron_name ]] && cron_name=$(grep "name:" $file | awk -F ":" '{print $2}' | head -1 | xargs)
+      [[ -z $cron_name ]] && cron_name=$(basename "$file_name")
+      cron_name=${cron_name//$'\r'/}
+      cron_line=${cron_line//$'\r'/}
+      result=$(add_cron_api "$cron_line" "${cmd_task} ${file}" "$cron_name" "$SUB_ID")
+      echo -e "$result"
+      if [[ $detail ]]; then
+        detail="${detail}${result}\n"
+      else
+        detail="${result}\n"
+      fi
+    fi
+  done
+  notify_api "$(t '%s 新增任务' "$path")" "$detail"
+}
+
+## 更新仓库
+update_repo() {
+  local url="$1"
+  local path="$2"
+  local blackword="$3"
+  local dependence="$4"
+  local branch="$5"
+  local extensions="$6"
+  local proxy="$7"
+  local autoAddCron="$8"
+  local autoDelCron="$9"
+  local tmp="${url%/*}"
+  local authorTmp1="${tmp##*/}"
+  local authorTmp2="${authorTmp1##*:}"
+  local author="${authorTmp2##*.}"
+
+  local repo_path="${dir_repo}/${uniq_path}"
+
+  make_dir "${dir_scripts}/${uniq_path}"
+
+  local formatUrl="$url"
+  rm -rf ${repo_path} &>/dev/null
+  git_clone_scripts "${formatUrl}" ${repo_path} "${branch}" "${proxy}"
+
+  if [[ $exit_status -eq 0 ]]; then
+    t '拉取 %s 成功...\n' "${uniq_path}"
+    diff_scripts "$repo_path" "$author" "$path" "$blackword" "$dependence" "$extensions" "$autoAddCron" "$autoDelCron"
+  else
+    t '拉取 %s 失败，请检查日志...\n' "${uniq_path}"
+  fi
+}
+
+## 更新所有 raw 文件
+update_raw() {
+  local url="$1"
+  local proxy="$2"
+  local autoAddCron="$3"
+  local autoDelCron="$4"
+
+  if [[ ! $autoAddCron ]]; then
+    autoAddCron=${AutoAddCron}
+  fi
+  if [[ ! $autoDelCron ]]; then
+    autoDelCron=${AutoDelCron}
+  fi
+
+  local raw_url="$url"
+  local suffix="${raw_url##*.}"
+  local raw_file_name="${uniq_path}.${suffix}"
+  t '开始下载：%s 保存路径：%s\n' "${raw_url}" "$dir_raw/${raw_file_name}"
+
+  set_proxy "$proxy"
+  if wget -q --no-check-certificate -O "$dir_raw/${raw_file_name}.new" "$raw_url"; then
+    exit_status=0
+  else
+    exit_status=$?
+  fi
+  unset_proxy
+
+  if [[ $exit_status -eq 0 ]]; then
+    mv "$dir_raw/${raw_file_name}.new" "$dir_raw/${raw_file_name}" || return $?
+    t '下载 %s 成功...\n' "${raw_file_name}"
+    cd "$dir_raw" || return $?
+    local filename="raw_${raw_file_name}"
+    local cron_id=$(cat "$list_crontab_user" | grep -E "$cmd_task.* $filename" | perl -pe "s|.*ID=(.*) $cmd_task.* $filename\.*|\1|" | head -1 | awk -F " " '{print $1}')
+    cp -f "$raw_file_name" "$dir_scripts/${filename}" || return $?
+    if [[ -z $cron_id ]] && [[ ${autoAddCron} == true ]]; then
+      cron_line=$(
+        perl -ne "{
+                      print if /.*([\d\*]*[\*-\/,\d]*[\d\*] ){4,5}[\d\*]*[\*-\/,\d]*[\d\*]( |,|\").*$raw_file_name/
+                  }" $raw_file_name |
+          perl -pe "{
+                      s|[^\d\*]*(([\d\*]*[\*-\/,\d]*[\d\*] ){4,5}[\d\*]*[\*-\/,\d]*[\d\*])( \|,\|\").*/?$raw_file_name.*|\1|g;
+                      s|\*([\d\*])(.*)|\1\2|g;
+                      s|  | |g;
+                  }" | sort -u | head -1
+      )
+      cron_name=$(grep "new Env" $raw_file_name | awk -F "\(" '{print $2}' | awk -F "\)" '{print $1}' | sed 's:.*\('\''\|"\)\([^"'\'']*\)\('\''\|"\).*:\2:' | sed 's:"::g' | sed "s:'::g" | head -1)
+      [[ -z $cron_name ]] && cron_name="$raw_file_name"
+      [[ -z $cron_line ]] && cron_line=$(grep "cron:" $raw_file_name | awk -F ":" '{print $2}' | head -1 | xargs)
+      [[ -z $cron_line ]] && cron_line=$(grep "cron " $raw_file_name | awk -F "cron \"" '{print $2}' | awk -F "\" " '{print $1}' | head -1 | xargs)
+      [[ -z $cron_line ]] && cron_line="$default_cron"
+      cron_name=${cron_name//$'\r'/}
+      cron_line=${cron_line//$'\r'/}
+      result=$(add_cron_api "$cron_line" "${cmd_task} ${filename}" "$cron_name" "$SUB_ID")
+      echo -e "$result\n"
+      notify_api "$(t '新增任务通知')" "\n$result"
+      # update_cron_api "$cron_line:$cmd_task $filename:$cron_name:$cron_id"
+    fi
+  else
+    t '下载 %s 失败，保留之前正常下载的版本...\n' "${raw_file_name}"
+    [[ -f "$dir_raw/${raw_file_name}.new" ]] && rm -f "$dir_raw/${raw_file_name}.new"
+    return "$exit_status"
+  fi
+
+}
+
+## 调用用户自定义的extra.sh
+run_extra_shell() {
+  if [[ -f $file_extra_shell ]]; then
+    . "$file_extra_shell"
+  else
+    t '%s文件不存在，跳过执行...\n' "$file_extra_shell"
+  fi
+}
+
+## 查看青龙服务日志
+show_service_logs() {
+  local lines="15"
+  local no_stream="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --lines)
+      if [[ ! "${2:-}" =~ ^[0-9]+$ ]]; then
+        echo "ql log: --lines requires a non-negative integer" >&2
+        return 2
+      fi
+      lines="$2"
+      shift 2
+      ;;
+    --lines=*)
+      lines="${1#--lines=}"
+      if [[ ! "$lines" =~ ^[0-9]+$ ]]; then
+        echo "ql log: --lines requires a non-negative integer" >&2
+        return 2
+      fi
+      shift
+      ;;
+    --nostream)
+      no_stream="true"
+      shift
+      ;;
+    *)
+      echo "ql log: unknown option: $1" >&2
+      return 2
+      ;;
+    esac
+  done
+
+  local system_log_dir="$dir_data/syslog"
+  local latest_system_log
+  latest_system_log=$(ls -1t "$system_log_dir"/*.log* 2>/dev/null | head -n 1)
+  if [[ "$lines" != "0" ]] && [[ -f "$latest_system_log" ]]; then
+    tail -n "$lines" "$latest_system_log"
+  fi
+
+  if [[ "$no_stream" == "true" ]]; then
+    if [[ -z "$latest_system_log" ]]; then
+      echo "ql log: no system log found in $system_log_dir" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  # Winston writes the active runtime log by date. Follow the filename so
+  # size-based rotations are handled without involving the PM2 log files.
+  local current_system_log="$system_log_dir/$(date +%F).log"
+  # GNU and BSD tail both support -F; --retry is GNU-only and implied by -F.
+  tail -n 0 -F "$current_system_log"
+}
+
+## 脚本用法
+usage() {
+  t '%s 命令使用方法：' "$cmd_update"
+  echo -e "1.  $cmd_update update                                                                  # $(t '更新并重启青龙')"
+  echo -e "2.  $cmd_update extra                                                                   # $(t '运行自定义脚本')"
+  echo -e "3.  $cmd_update raw <fileurl>                                                           # $(t '更新单个脚本文件')"
+  echo -e "4.  $cmd_update repo <repourl> <path> <blacklist> <dependence> <branch> <extensions>    # $(t '更新单个仓库的脚本')"
+  echo -e "5.  $cmd_update rmlog <days>                                                            # $(t '删除旧日志')"
+  echo -e "6.  $cmd_update bot                                                                     # $(t '启动tg-bot')"
+  echo -e "7.  $cmd_update check                                                                   # $(t '检测青龙环境并修复')"
+  echo -e "8.  $cmd_update log [--lines <n>] [--nostream]                                         # $(t '查看青龙运行日志')"
+  echo -e "9.  $cmd_update resetlet                                                                # $(t '重置登录错误次数')"
+  echo -e "10. $cmd_update resettfa                                                                # $(t '禁用两步登录')"
+  echo -e "11. $cmd_update resetpwd                                                                # $(t '修改登录密码')"
+  echo -e "12. $cmd_update resetname                                                               # $(t '修改登录用户名')"
+}
+
+reload_qinglong() {
+  local reload_target="${1}"
+  if [[ "$reload_target" == 'system' ]]; then
+    QlPort="${ql_port:-${QlPort:-5700}}" QlBaseUrl="${ql_base_url:-${QlBaseUrl:-/}}" node "$dir_shell/upgrade.cjs" reload
+    return $?
+  fi
+
+  # Data import and a plain service restart retain their existing behavior.
+  echo -e "[reload_qinglong] deleting Triggered at $(date)" >>"${dir_log}/reload.log"
+  sleep 3
+  delete_pm2
+  if [[ "$reload_target" == 'data' ]]; then
+    rm -rf "${dir_data:?}"/*
+    mv -f "$dir_tmp"/data/* "$dir_data"/ || return $?
+  fi
+  reload_pm2
+}
+
+## 更新 qinglong
+update_qinglong() {
+  local mirror="gitee"
+  if curl --fail --silent --noproxy "*" --max-time 2 --head "https://github.com" >/dev/null; then
+    mirror="github"
+  fi
+  t '使用 %s 源更新...\n' "$mirror"
+  QlPort="${ql_port:-${QlPort:-5700}}" QlBaseUrl="${ql_base_url:-${QlBaseUrl:-/}}" node "$dir_shell/upgrade.cjs" update "$mirror" "$needRestart"
+}
+
+# Preserve the updater's status through both tee and the final timing output.
+run_update_logged() (
+  set -o pipefail
+  if [[ "$real_time" == 'true' ]]; then
+    "$@"
+  elif [[ "$no_tee" == 'true' ]]; then
+    "$@" >>"$file_path" 2>&1
+  else
+    "$@" 2>&1 | tee -a "$file_path"
+  fi
+)
+
+## 对比脚本
+diff_scripts() {
+  local dir_current=$(pwd)
+  local repo_path="$1"
+  local author="$2"
+  local path="$3"
+  local blackword="$4"
+  local dependence="$5"
+  local extensions="$6"
+  local autoAddCron="$7"
+  local autoDelCron="$8"
+
+  if [[ ! $autoAddCron ]]; then
+    autoAddCron=${AutoAddCron}
+  fi
+  if [[ ! $autoDelCron ]]; then
+    autoDelCron=${AutoDelCron}
+  fi
+
+  gen_list_repo "$repo_path" "$author" "$path" "$blackword" "$dependence" "$extensions"
+
+  local list_add="$dir_list_tmp/${uniq_path}_add.list"
+  local list_drop="$dir_list_tmp/${uniq_path}_drop.list"
+  diff_cron "$dir_list_tmp/${uniq_path}_scripts.list" "$dir_list_tmp/${uniq_path}_user.list" $list_add $list_drop
+
+  if [[ -s $list_drop ]]; then
+    output_list_add_drop $list_drop "失效"
+    if [[ ${autoDelCron} == true ]]; then
+      del_cron $list_drop $uniq_path
+    fi
+  fi
+  if [[ -s $list_add ]]; then
+    output_list_add_drop $list_add "新"
+    if [[ ${autoAddCron} == true ]]; then
+      add_cron $list_add $uniq_path
+    fi
+  fi
+  cd $dir_current
+}
+
+## 生成脚本的路径清单文件
+gen_list_repo() {
+  local dir_current=$(pwd)
+  local repo_path="$1"
+  local author="$2"
+  local path="$3"
+  local blackword="$4"
+  local dependence="$5"
+
+  rm -f $dir_list_tmp/${uniq_path}*.list &>/dev/null
+
+  cd ${repo_path}
+
+  local extension_string="${6:-$file_extensions}"
+  extension_string="${extension_string//|/ }"
+  extension_string="${extension_string//$'\n'/ }"
+  local -a extensions=() find_args=()
+  IFS=$' \t\n' read -r -a extensions <<< "$extension_string"
+  local extension
+  for extension in "${extensions[@]}"; do
+    if [[ ${#find_args[@]} -gt 0 ]]; then
+      find_args+=(-o)
+    fi
+    find_args+=(-name "*.${extension}")
+  done
+  files=$(find . "${find_args[@]}" | sed 's/^..//')
+  if [[ $path ]]; then
+    files=$(echo "$files" | egrep "$path")
+  fi
+  if [[ $blackword ]]; then
+    files=$(echo "$files" | egrep -v "$blackword")
+  fi
+
+  cp -f $file_notify_js "${dir_scripts}/${uniq_path}"
+  cp -f $file_notify_py "${dir_scripts}/${uniq_path}"
+
+  if [[ $dependence ]]; then
+    cd ${repo_path}
+    results=$(find . "${find_args[@]}" | sed 's/^..//' | egrep "$dependence")
+    for _file in ${results}; do
+      file_path=$(dirname $_file)
+      make_dir "${dir_scripts}/${uniq_path}/${file_path}"
+      cp -f $_file "${dir_scripts}/${uniq_path}/${file_path}"
+    done
+  fi
+
+  if [[ -d $dir_dep ]]; then
+    cp -rf $dir_dep/* "${dir_scripts}/${uniq_path}" &>/dev/null
+  fi
+
+  for file in ${files}; do
+    dirPath=$(dirname "$file")
+    filename=$(basename "$file")
+    filePath="${uniq_path}/${filename}"
+    if [[ $dirPath ]] && [[ $dirPath != '.' ]]; then
+      mkdir -p "${dir_scripts}/${uniq_path}/${dirPath}"
+      filePath="${uniq_path}/${dirPath}/${filename}"
+    fi
+    cp -f $file "${dir_scripts}/$filePath"
+    echo "$filePath" >>"$dir_list_tmp/${uniq_path}_scripts.list"
+    # cron_id=$(cat $list_crontab_user | grep -E "$cmd_task.* ${uniq_path}_${filename}" | perl -pe "s|.*ID=(.*) $cmd_task.* ${uniq_path}_${filename}\.*|\1|" | head -1 | awk -F " " '{print $1}')
+    # if [[ $cron_id ]]; then
+    #   result=$(update_cron_command_api "$cmd_task ${uniq_path}/${filename}:$cron_id")
+    # fi
+  done
+  grep -E "${cmd_task}.* ${uniq_path}" ${list_crontab_user} | perl -pe "s|.*ID=(.*) ${cmd_task}.* (${uniq_path}.*)\.*|\2|" | awk -F " " '{print $1}' | sort -u >"$dir_list_tmp/${uniq_path}_user.list"
+  cd $dir_current
+}
+
+get_uniq_path() {
+  local url="$1"
+  local branch="$2"
+  local urlTmp="${url%*/}"
+  local repoTmp="${urlTmp##*/}"
+  local repo="${repoTmp%.*}"
+  local tmp="${url%/*}"
+  local authorTmp1="${tmp##*/}"
+  local authorTmp2="${authorTmp1##*:}"
+  local author="${authorTmp2##*.}"
+
+  uniq_path="${author}_${repo}"
+  [[ $branch ]] && uniq_path="${uniq_path}_${branch}"
+}
+
+main() {
+  ## for ql update
+  show_log="false"
+  while getopts ":l" opt; do
+    case $opt in
+    l)
+      show_log="true"
+      ;;
+    esac
+  done
+  [[ "$show_log" == "true" ]] && shift $(($OPTIND - 1))
+
+  local p1="${1}"
+  local p2="${2}"
+  local p3="${3}"
+  local p4="${4}"
+  local p5="${5}"
+  local p6="${6}"
+  local p7="${7}"
+  local p8="${8}"
+  local p9="${9}"
+  local p10="${10}"
+
+  if [[ "$p1" == "log" ]]; then
+    show_service_logs "${@:2}"
+    return 0
+  fi
+
+  local log_dir="${p1}"
+  make_dir "$dir_log/$log_dir"
+  local log_time=$(date "+%Y-%m-%d-%H-%M-%S")
+  local log_path="${log_dir}/${log_time}.log"
+  local file_path="$dir_log/$log_path"
+
+  printf -v cmd '2>&1 | tee -a %q' "$file_path"
+  if [[ "$no_tee" == "true" ]]; then
+    printf -v cmd '>> %q 2>&1' "$file_path"
+  fi
+  if [[ "$real_time" == "true" ]]; then
+    cmd=""
+  fi
+
+  local time_format="%Y-%m-%d %H:%M:%S"
+  local time=$(date "+$time_format")
+  local begin_timestamp=$(format_timestamp "$time_format" "$time")
+
+  local begin_time=$(format_time "$time_format" "$time")
+
+  if [[ "$p1" != "repo" ]] && [[ "$p1" != "raw" ]]; then
+    local start_message
+    printf -v start_message '%q' "$(t '## 开始执行... %s\n' "$begin_time")"
+    eval "printf '%s\n' $start_message $cmd"
+  fi
+
+  [[ $ID ]] && update_cron "\"$ID\"" "0" "$$" "$log_path" "$begin_timestamp"
+
+  local command_status=0
+  case $p1 in
+  update)
+    fix_config
+    local needRestart=${p2:-"true"}
+    run_update_logged update_qinglong
+    command_status=$?
+    ;;
+  reload)
+    run_update_logged reload_qinglong "$p2"
+    command_status=$?
+    ;;
+  extra)
+    eval run_extra_shell $cmd
+    ;;
+  repo)
+    get_uniq_path "$p2" "$p6"
+    if [[ -n $p2 ]]; then
+      update_repo "$p2" "$p3" "$p4" "$p5" "$p6" "$p7" "$p8" "$p9" "$p10"
+    else
+      t '命令输入错误...\n'
+      eval usage $cmd
+    fi
+    ;;
+  raw)
+    get_uniq_path "$p2"
+    if [[ -n $p2 ]]; then
+      update_raw "$p2" "$p3" "$p4" "$p5"
+      command_status=$?
+    else
+      t '命令输入错误...\n'
+      eval usage $cmd
+    fi
+    ;;
+  rmlog)
+    eval '. "$dir_shell/rmlog.sh" "$p2"' "$cmd"
+    ;;
+  bot)
+    eval '. "$dir_shell/bot.sh"' "$cmd"
+    ;;
+  check)
+    eval '. "$dir_shell/check.sh"' "$cmd"
+    ;;
+  resetlet)
+    eval update_auth_config "\\\"retries\\\":0" "重置登录错误次数" $cmd
+    ;;
+  resettfa)
+    eval update_auth_config "\\\"twoFactorActivated\\\":false" "禁用两步验证" $cmd
+    ;;
+  resetpwd)
+    eval update_auth_config "\\\"password\\\":\\\"$p2\\\"" "重置密码" $cmd
+    ;;
+  resetname)
+    eval update_auth_config "\\\"username\\\":\\\"$p2\\\"" "重置用户名" $cmd
+    ;;
+  *)
+    t '命令输入错误...\n'
+    eval usage $cmd
+    ;;
+  esac
+
+  local etime=$(date "+$time_format")
+  local end_time=$(format_time "$time_format" "$etime")
+  local end_timestamp=$(format_timestamp "$time_format" "$etime")
+  local diff_time=$(($end_timestamp - $begin_timestamp))
+  [[ $ID ]] && update_cron "\"$ID\"" "1" "$$" "$log_path" "$begin_timestamp" "$diff_time"
+
+  if [[ "$p1" != "repo" ]] && [[ "$p1" != "raw" ]]; then
+    local end_message
+    printf -v end_message '%q' "$(t '\n## 执行结束... %s  耗时 %s 秒' "$end_time" "$diff_time")　　　　　"
+    eval "printf '%s\n' $end_message $cmd"
+  fi
+  return "$command_status"
+}
+
+import_config "$@"
+main "$@"
+exit $?
