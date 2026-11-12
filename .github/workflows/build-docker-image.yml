@@ -1,0 +1,611 @@
+name: Build And Push Docker Image
+
+on:
+  push:
+    paths:
+      - "**"
+      - "!*.md"
+      # CLI is verified separately; its shared Bash upgrade engine ships in images.
+      - "!cli/**"
+      - "cli/src/internal/maintenance/upgradeArtifacts.cjs"
+      - "cli/src/internal/maintenance/platformBundle.cjs"
+      - "cli/src/internal/maintenance/upgradePrestart.cjs"
+      - "cli/src/internal/maintenance/panelUpgrade.cjs"
+      - "cli/src/internal/maintenance/nodeRuntime.cjs"
+      - "!.github/workflows/cli-package.yml"
+    branches:
+      - "master"
+      - "develop"
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      static_sync_only:
+        description: Synchronize an existing static snapshot to GitLab and verify Gitee
+        type: boolean
+        default: false
+      static_ref:
+        description: Static branch or version name, for example v2.22.0
+        type: string
+        default: ''
+      static_ref_type:
+        description: Synchronize a branch, or a version branch and Git tag
+        type: choice
+        options: [branch, tag]
+        default: branch
+      npm_rc_version:
+        description: Publish the verified main npm RC from develop, for example 2.25.0-rc.0
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# Keep master image tags and their bundle indexes in one serialized release.
+# A rerun may intentionally replace a version, including from the same commit.
+# Develop image builds and their shared bundle index serialize separately.
+# Git-tag builds and static synchronization remain independent.
+concurrency:
+  group: version-images-${{ github.ref == 'refs/heads/master' && 'master' || (github.ref == 'refs/heads/develop' && !inputs.static_sync_only && 'develop') || format('{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: ${{ !inputs.static_sync_only }}
+    uses: ./.github/workflows/validate.yml
+
+  code_gitlab:
+    if: ${{ !inputs.static_sync_only }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Push to GitLab
+        run: |
+          set +e
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.GITLAB_SSH_PK }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -T 10 gitlab.com >> ~/.ssh/known_hosts 2>/dev/null
+          git remote add gitlab git@gitlab.com:whyour/qinglong.git 2>/dev/null
+          git push --force --all gitlab 2>&1 || echo "::warning::GitLab push failed"
+          git push --force --tags gitlab 2>&1 || echo "::warning::GitLab tags push failed"
+
+  build-static:
+    if: ${{ !inputs.static_sync_only }}
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: "8.3.1"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: ".nvmrc"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: build front and back
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build:front
+          pnpm build:back
+          pnpm build:info
+
+      - name: Pack the npm panel archive from the verified build
+        run: node scripts/verify-panel-package.cjs pack "$RUNNER_TEMP/npm-panel"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: qinglong-static-${{ github.sha }}
+          path: static/
+          if-no-files-found: error
+          include-hidden-files: true
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: qinglong-npm-${{ github.sha }}
+          path: ${{ runner.temp }}/npm-panel/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: copy to static repo
+        env:
+          GITHUB_REPO: github.com/${{ github.repository_owner }}/qinglong-static
+          GITHUB_BRANCH: ${{ github.ref_name }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          STATIC_TOKEN: ${{ secrets.API_TOKEN }}
+        run: |
+          : "${STATIC_TOKEN:?Missing static repository token}"
+          bash scripts/publish-static.sh "https://x-access-token:${STATIC_TOKEN}@${GITHUB_REPO}.git" "$GITHUB_BRANCH" "$GITHUB_REF_TYPE"
+
+      - name: publish verified upgrade download sizes
+        env:
+          GITHUB_REPO: github.com/${{ github.repository_owner }}/qinglong-static
+          GITHUB_BRANCH: ${{ github.ref_name }}
+          STATIC_TOKEN: ${{ secrets.API_TOKEN }}
+        run: |
+          : "${STATIC_TOKEN:?Missing static repository token}"
+          node scripts/publish-upgrade-info.cjs "https://x-access-token:${STATIC_TOKEN}@${GITHUB_REPO}.git" "$GITHUB_BRANCH" "$GITHUB_SHA"
+
+  static_gitlab:
+    needs: build-static
+    runs-on: ubuntu-latest
+    concurrency:
+      group: static-gitlab-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - name: Push qinglong-static to GitLab
+        env:
+          STATIC_BRANCH: ${{ github.ref_name }}
+          STATIC_REF_TYPE: ${{ github.ref_type }}
+          MIRROR_SSH_KEY: ${{ secrets.GITLAB_SSH_PK }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$MIRROR_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -T 10 gitlab.com >> ~/.ssh/known_hosts 2>/dev/null
+          bash scripts/sync-static.sh git@gitlab.com:whyour/qinglong-static.git "$STATIC_BRANCH" "$STATIC_REF_TYPE"
+
+  verify-gitee-mirrors:
+    needs: build-static
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        repository: [qinglong, qinglong-static]
+    steps:
+      - uses: actions/checkout@v6
+      # Gitee Pull mirrors and GitHub push webhooks own synchronization.
+      # Verification runs alongside Docker builds and needs no Gitee credentials.
+      - name: Wait for Gitee Pull mirror
+        if: ${{ matrix.repository == 'qinglong' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QL_MIRROR_NOTIFY_REPO: whyour/qinglong
+          MIRROR_REPOSITORY: ${{ matrix.repository }}
+          MIRROR_REF: ${{ github.ref_name }}
+          MIRROR_REF_TYPE: ${{ github.ref_type }}
+          QL_MIRROR_INCLUDE_VERSION_BRANCH: ${{ matrix.repository == 'qinglong-static' }}
+          QL_MIRROR_NOTIFY_ON_START: 'false'
+        run: |
+          bash scripts/wait-for-mirror.sh "https://github.com/whyour/$MIRROR_REPOSITORY.git" "https://gitee.com/whyour/$MIRROR_REPOSITORY.git" "$MIRROR_REF" "$MIRROR_REF_TYPE"
+      - name: Notify and wait for Gitee static mirror
+        if: ${{ matrix.repository == 'qinglong-static' }}
+        env:
+          GH_TOKEN: ${{ secrets.API_TOKEN }}
+          QL_MIRROR_NOTIFY_REPO: whyour/qinglong-static
+          MIRROR_REF: ${{ github.ref_name }}
+          MIRROR_REF_TYPE: ${{ github.ref_type }}
+          QL_MIRROR_INCLUDE_VERSION_BRANCH: 'true'
+        run: |
+          bash scripts/wait-for-mirror.sh https://github.com/whyour/qinglong-static.git https://gitee.com/whyour/qinglong-static.git "$MIRROR_REF" "$MIRROR_REF_TYPE"
+
+  sync-existing-static:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.static_sync_only }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mirror: [gitlab]
+    concurrency:
+      group: static-${{ matrix.mirror }}-${{ inputs.static_ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - name: Synchronize existing static snapshot
+        env:
+          STATIC_REF: ${{ inputs.static_ref }}
+          STATIC_REF_TYPE: ${{ inputs.static_ref_type }}
+          MIRROR_HOST: ${{ matrix.mirror }}.com
+          MIRROR_SSH_KEY: ${{ secrets.GITLAB_SSH_PK }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$MIRROR_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -T 10 "$MIRROR_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          bash scripts/sync-static.sh "git@$MIRROR_HOST:whyour/qinglong-static.git" "$STATIC_REF" "$STATIC_REF_TYPE"
+
+  verify-existing-static-gitee:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.static_sync_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v6
+      - name: Wait for existing Gitee static snapshot
+        env:
+          GH_TOKEN: ${{ secrets.API_TOKEN }}
+          QL_MIRROR_NOTIFY_REPO: whyour/qinglong-static
+          MIRROR_REF: ${{ inputs.static_ref }}
+          MIRROR_REF_TYPE: ${{ inputs.static_ref_type }}
+          QL_MIRROR_INCLUDE_VERSION_BRANCH: 'true'
+        run: |
+          bash scripts/wait-for-mirror.sh https://github.com/whyour/qinglong-static.git https://gitee.com/whyour/qinglong-static.git "$MIRROR_REF" "$MIRROR_REF_TYPE"
+
+  build-alpine:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    needs: build-static
+    outputs:
+      image-digest: ${{ steps.image.outputs.digest }}
+    runs-on: ubuntu-22.04
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with:
+          name: qinglong-static-${{ github.sha }}
+          path: static/
+      - uses: pnpm/action-setup@v6
+        with:
+          version: "8.3.1"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Read version from version.yaml
+        id: version
+        run: |
+          VERSION=$(grep '^version:' version.yaml | awk '{print $2}')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Setup timezone
+        run: sudo timedatectl set-timezone Asia/Shanghai
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ${{ github.repository }}
+            ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=branch,enable=${{ github.ref == format('refs/heads/{0}', 'develop') }}
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'master') }}
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ github.ref == format('refs/heads/{0}', 'master') }}
+            type=semver,pattern={{version}}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          cache-image: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push (Alpine)
+        id: image
+        uses: docker/build-push-action@v7
+        with:
+          build-args: |
+            QL_MAINTAINER=${{ github.repository_owner }}
+            QL_BRANCH=${{ github.ref_name }}
+            SOURCE_COMMIT=${{ github.sha }}
+          network: host
+          platforms: linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/ppc64le,linux/s390x,linux/386
+          context: .
+          file: ./docker/Dockerfile
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=whyour/qinglong:cache-alpine
+          cache-to: type=registry,ref=whyour/qinglong:cache-alpine,mode=max
+
+  build-debian:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    needs: build-static
+    outputs:
+      image-digest: ${{ steps.image.outputs.digest }}
+    runs-on: ubuntu-22.04
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with:
+          name: qinglong-static-${{ github.sha }}
+          path: static/
+      - uses: pnpm/action-setup@v6
+        with:
+          version: "8.3.1"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Read version from version.yaml
+        id: version
+        run: |
+          VERSION=$(grep '^version:' version.yaml | awk '{print $2}')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Setup timezone
+        run: sudo timedatectl set-timezone Asia/Shanghai
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ${{ github.repository }}
+            ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=debian-dev,enable=${{ github.ref == format('refs/heads/{0}', 'develop') }}
+            type=raw,value=debian,enable=${{ github.ref == format('refs/heads/{0}', 'master') }}
+            type=raw,value=${{ steps.version.outputs.version }}-debian,enable=${{ github.ref == format('refs/heads/{0}', 'master') }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          cache-image: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push (Debian)
+        id: image
+        uses: docker/build-push-action@v7
+        with:
+          build-args: |
+            QL_MAINTAINER=${{ github.repository_owner }}
+            QL_BRANCH=${{ github.ref_name }}
+            SOURCE_COMMIT=${{ github.sha }}
+          network: host
+          # Keep s390x on Debian: npm can hang under QEMU with Alpine (nodejs/docker-node#1973).
+          platforms: linux/amd64,linux/arm64,linux/ppc64le,linux/s390x
+          context: .
+          file: ./docker/Dockerfile.debian
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=whyour/qinglong:cache-debian
+          cache-to: type=registry,ref=whyour/qinglong:cache-debian,mode=max
+
+  # One unmodified amd64 package for migration acceptance only. This does not
+  # publish bundles or advance development/formal channel indexes.
+  build-npm-migration-bundle:
+    needs: build-debian
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - name: Export the official platform package from this run's image digest
+        env:
+          IMAGE_DIGEST: ${{ needs.build-debian.outputs.image-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          image="ghcr.io/${GITHUB_REPOSITORY}@${IMAGE_DIGEST}"
+          docker buildx build --platform linux/amd64 --build-arg "BASE_IMAGE=$image" --file docker/Dockerfile.upgrade-bundle --output "type=local,dest=$RUNNER_TEMP/npm-migration-bundle" .
+      - uses: actions/upload-artifact@v6
+        with:
+          name: npm-migration-bundle-${{ github.sha }}
+          path: ${{ runner.temp }}/npm-migration-bundle/*
+          if-no-files-found: error
+          retention-days: 3
+
+  verify-npm-package:
+    needs: [build-static, build-npm-migration-bundle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20.18.1', '24']
+    container: node:${{ matrix.node }}-bookworm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v6
+        with:
+          name: qinglong-npm-${{ github.sha }}
+          path: ${{ runner.temp }}/npm-panel/
+      - uses: actions/download-artifact@v6
+        with:
+          name: npm-migration-bundle-${{ github.sha }}
+          path: ${{ runner.temp }}/npm-migration-bundle/
+      - name: Install isolated service test tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 openssl curl jq nginx procps
+          # The published legacy launcher resets PATH to standard directories.
+          # /usr/local is confined to this disposable job container; PM2_HOME
+          # remains private to each verification run.
+          npm install --global --prefix /usr/local --no-audit --no-fund pm2@6.0.14
+      - name: Install and upgrade the exact npm archive
+        env:
+          QL_PANEL_PACKAGE_TEST_ISOLATED: '1'
+          QL_PANEL_TEST_PM2: /usr/local/bin/pm2
+          QL_PANEL_TEST_BUNDLE_DIR: ${{ runner.temp }}/npm-migration-bundle
+        run: node scripts/verify-panel-package.cjs verify "$RUNNER_TEMP/npm-panel" "$RUNNER_TEMP/npm-panel-results"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: qinglong-npm-verification-${{ matrix.node }}-${{ github.sha }}
+          path: ${{ runner.temp }}/npm-panel-results/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: ${{ github.repository == 'whyour/qinglong' && (github.ref == 'refs/heads/master' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop')) }}
+    needs: [build-alpine, build-debian, verify-npm-package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Set up Node for trusted publishing
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: qinglong-npm-${{ github.sha }}
+          path: npm-panel/
+
+      - name: Publish npm package with OIDC
+        shell: bash
+        env:
+          NPM_RC_VERSION: ${{ inputs.npm_rc_version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(npm-panel/*.tgz)
+          if [ "${#archives[@]}" -ne 1 ]; then
+            echo '::error::Expected exactly one verified panel npm archive.'
+            exit 1
+          fi
+          archive="${archives[0]}"
+          metadata=$(tar -xOf "$archive" package/package.json)
+          name=$(jq -er '.name | select(. == "@whyour/qinglong")' <<< "$metadata")
+          version=$(jq -er '.version | select(type == "string")' <<< "$metadata")
+          if [[ "${GITHUB_EVENT_NAME:-}" == workflow_dispatch && "${GITHUB_REF:-}" == refs/heads/develop ]]; then
+            if [[ ! "${NPM_RC_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ || "$version" != "${NPM_RC_VERSION:-}" ]]; then
+              echo '::error::Develop npm publication requires the exact requested RC archive version.'
+              exit 1
+            fi
+          fi
+          if npm view "$name@$version" version --json --registry=https://registry.npmjs.org > "$RUNNER_TEMP/npm-version.json" 2> "$RUNNER_TEMP/npm-version-error.log"; then
+            jq -e --arg version "$version" '. == $version' "$RUNNER_TEMP/npm-version.json" > /dev/null
+            echo "::notice::$name@$version is already published; skipping npm publication for this image rebuild."
+          elif jq -e '.error.code == "E404"' "$RUNNER_TEMP/npm-version.json" > /dev/null; then
+            if [[ "${GITHUB_EVENT_NAME:-}" == workflow_dispatch && "${GITHUB_REF:-}" == refs/heads/develop ]]; then
+              npm publish "./$archive" --ignore-scripts --access public --tag rc --registry=https://registry.npmjs.org
+            else
+              npm publish "./$archive" --ignore-scripts --access public --registry=https://registry.npmjs.org
+            fi
+          else
+            echo '::error::Could not check the published npm version; refusing to publish.'
+            exit 1
+          fi
+
+  build-upgrade-bundles:
+    # Both channels publish packages from this run's immutable image digests.
+    if: ${{ !inputs.static_sync_only && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop') }}
+    needs: [build-alpine, build-debian]
+    # Node 24 can SIGILL while archiving ARM64 musl under x64 QEMU.
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-22.04' }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64, libc: musl, name: x64-musl }
+          - { platform: linux/arm/v6, libc: musl, name: armv6-musl }
+          - { platform: linux/arm/v7, libc: musl, name: armv7-musl }
+          - { platform: linux/arm64, libc: musl, name: arm64-musl }
+          - { platform: linux/ppc64le, libc: musl, name: ppc64-musl }
+          - { platform: linux/s390x, libc: musl, name: s390x-musl }
+          - { platform: linux/386, libc: musl, name: ia32-musl }
+          - { platform: linux/amd64, libc: glibc, name: x64-glibc }
+          - { platform: linux/arm64, libc: glibc, name: arm64-glibc }
+          - { platform: linux/ppc64le, libc: glibc, name: ppc64-glibc }
+          - { platform: linux/s390x, libc: glibc, name: s390x-glibc }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-qemu-action@v4
+        if: ${{ matrix.platform != 'linux/arm64' }}
+        with:
+          cache-image: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Build and probe the immutable platform package
+        env:
+          ALPINE_DIGEST: ${{ needs.build-alpine.outputs.image-digest }}
+          DEBIAN_DIGEST: ${{ needs.build-debian.outputs.image-digest }}
+          BUNDLE_LIBC: ${{ matrix.libc }}
+          BUNDLE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          digest="$ALPINE_DIGEST"
+          if [ "$BUNDLE_LIBC" = glibc ]; then digest="$DEBIAN_DIGEST"; fi
+          test -n "$digest"
+          image="ghcr.io/${GITHUB_REPOSITORY}@${digest}"
+          docker buildx build --platform "$BUNDLE_PLATFORM" --build-arg "BASE_IMAGE=$image" --file docker/Dockerfile.upgrade-bundle --output type=local,dest=output/upgrade .
+      - uses: actions/upload-artifact@v6
+        with:
+          name: upgrade-${{ matrix.name }}-${{ github.sha }}
+          path: output/upgrade/*
+          if-no-files-found: error
+
+  publish-upgrade-bundles:
+    if: ${{ !inputs.static_sync_only && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop') }}
+    needs: build-upgrade-bundles
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: upgrade-channel-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v6
+        with:
+          version: '8.3.1'
+      - run: pnpm install --prod --frozen-lockfile
+      - run: npm --prefix cli ci
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: upgrade-*-${{ github.sha }}
+          path: output/upgrade
+          merge-multiple: true
+      - run: node scripts/build-bundle-installer.cjs output/upgrade/install-bundle.cjs
+      - name: Publish complete packages before advancing the channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/publish-upgrade-bundles.cjs output/upgrade "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
